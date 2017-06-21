@@ -1,0 +1,657 @@
+#!/usr/bin/python
+
+import sys
+import logging
+import xml.etree.ElementTree as xmlET
+from pexpect import pxssh, EOF
+import re
+import netsnmp
+
+def xpath_result( root, xpath ):
+	res = root.findall(xpath)
+	if len(res) == 1:
+		return res[0].text
+	else:
+		return ''
+
+def listDiff(first, second):
+	second = set(second)
+	return [item for item in first if item not in second]
+
+class ConnectionProblem(Exception):
+	def __init__(self):
+		print '<doc><error><type>connection</type><text>Unable to connect. Check address, username or password.</text></error></doc>'
+
+class UnexpectedDataProblem(Exception):
+	def __init__(self, msg):
+		print '<doc><error><type>unexpected_data</type><text>' + msg + '</text></error></doc>'
+
+class QuantaHandler:
+	def __init__(self, request):
+		xmlRoot = xmlET.fromstring(request)
+		self.ip = xpath_result(xmlRoot, './device_params/ip')
+		self.username = xpath_result(xmlRoot, './device_params/ssh_user')
+		self.password = xpath_result(xmlRoot, './device_params/ssh_pass')
+
+		self.community = xpath_result(xmlRoot, './device_params/snmp_community')
+
+		function = xpath_result(xmlRoot, './func')
+
+		if function == 'status':
+			self.Status()
+		elif function == 'statistics':
+			self.Statistics()
+		elif function == 'port_on':
+			self.enablePort(xpath_result(xmlRoot, './port/identity'))
+		elif function == 'port_off':
+			self.disablePort(xpath_result(xmlRoot, './port/identity'))
+		elif function == 'set_vlan':
+			vlan_id = xpath_result(xmlRoot, './port/vlan_id')
+			is_trunk = True if xpath_result(xmlRoot, './port/is_trunk') == 'on' else False
+			trunk_members = xpath_result(xmlRoot, './port/trunk_members').split(',')
+
+			self.setPortVlan(xpath_result(xmlRoot, './port/identity'), vlan_id, is_trunk, trunk_members)
+		else:
+			logging.debug('function ' + function + ' not found.')
+
+	def login(self):
+		logging.debug('Login in via SSH')
+
+		ssh = pxssh.pxssh()
+		ssh.PROMPT = '\(FASTPATH\sRouting|Switching\)\s(\([a-zA-Z0-9\/\s]+\))?[>|#]$'
+
+		if not ssh.login (self.ip, self.username, self.password, auto_prompt_reset=False, original_prompt=ssh.PROMPT):
+			raise ConnectionProblem
+
+		ssh.sendline('enable')
+		ssh.expect('Password:')
+		ssh.sendline(self.password)
+
+		ssh.prompt()
+
+		ssh.sendline('terminal length 0')
+		ssh.prompt()
+
+		logging.debug('Successfully logged in via SSH')
+
+		return ssh
+
+	def logout(self, ssh):
+		logging.debug('Logging out via SSH')
+
+		ssh.sendline()
+		ssh.prompt()
+
+		ssh.sendline('quit')
+
+		index = ssh.expect([EOF, 'Would you like to save them now\? \(y/n\)'])
+
+		if index == 1:
+			ssh.sendline('y')
+			ssh.expect(['y\r\n', 'Config file \'startup-config\' created successfully'])
+
+		ssh.close()
+
+		logging.debug('Successfully logged out via SSH')
+
+		return True
+
+	def parsePortAdminMode(self, mode):
+		if mode == 'Enable':
+			return 'on'
+		elif mode == 'Disable':
+			return 'off'
+
+		return 'unknown'
+
+	def parsePortPhysicalMode(self, mode):
+		if mode == 'Auto':
+			return 'auto'
+		elif mode == '10 Full' or mode == '10 Half':
+			return '10mbps'
+		elif mode == '100 Full' or mode == '100 Half':
+			return '100mbps'
+		elif mode == '1000 Full' or mode == '1000 Half':
+			return '1000mbps'
+		elif mode == '10G Full' or mode == '10G Half':
+			return '10gbps'
+
+		return 'unknown'
+
+	def parsePortPhysicalStatus(self, status):
+		if status == '10 Full' or status == '10 Half':
+			return '10mbps'
+		elif status == '100 Full' or status == '100 Half':
+			return '100mbps'
+		elif status == '1000 Full' or status == '1000 Half':
+			return '1gbps'
+		elif status == '10G Full' or status == '10G Half':
+			return '10gbps'
+
+		return 'unknown'
+
+	def parsePortLinkStatus(self, status):
+		if status == 'Up':
+			return 'on'
+		elif status == 'Down':
+			return 'off'
+
+		return 'unknown'
+
+	def parsePortDuplex (self, mode):
+		if 'Full' in mode:
+			return 'full'
+		elif 'Half' in mode:
+			return 'half'
+
+		return 'auto'
+
+	def parsePortList(self, port_string, ports = {}):
+		for line in port_string.splitlines():
+			match = re.match('^0\/(\d+)\s+(Mirror|Probe)?\s+(Enable|Disable)\s+([a-zA-Z0-9]+\s[a-zA-Z]+|Auto)\s+([a-zA-Z0-9]+\s[a-zA-Z]+)?\s+(Up|Down)\s+(Enable|Disable)\s+(Enable|Disable)\s+([a-zA-Z]+)', line, re.I)
+
+			if match:
+				ident = match.group(1)
+				ports[ident] = self.SwitchPort(ident)
+
+				ports[ident].AdminMode = self.parsePortAdminMode(match.group(3))
+				ports[ident].PhysicalMode = self.parsePortPhysicalMode(match.group(4))
+				ports[ident].PhysicalStatus = self.parsePortPhysicalStatus(match.group(5))
+				ports[ident].LinkStatus = self.parsePortLinkStatus(match.group(6))
+				ports[ident].Duplex = self.parsePortDuplex(match.group(3))
+
+		return ports
+
+	def parseVlanList(self, vlan_string, vlans = {}):
+		for line in vlan_string.splitlines():
+			match = re.match('^(\d+)\s+([a-zA-Z0-9\s\-\_]+)(Default|Static|Default)', line, re.I)
+
+			if match:
+				ident = match.group(1)
+
+				vlans[ident] = self.SwitchVlan(ident)
+				vlans[ident].Description = match.group(2).strip()
+
+		return vlans
+
+	def parseVlanPortAssociationList(self, port_string, vlan, ports = {}):
+		for line in port_string.splitlines():
+			match = re.match('^0\/(\d+)\s+(Include|Exclude)\s+(Include|Exclude|Autodetect)\s+(Tagged|Untagged)', line, re.I)
+
+			if match:
+				ident = match.group(1)
+
+				if match.group(2) == 'Include':
+					if match.group(4) == 'Tagged':
+						ports[ident].Vlans['tagged'].append(vlan.Ident)
+					elif match.group(4) == 'Untagged':
+						logging.debug('Found untagged port: ' + ident)
+					else:
+						raise UnexpectedDataProblem('Could not parse vlan port')
+
+		return ports
+
+	def parseVlanPortList(self, port_string, ports = {}):
+		for line in port_string.splitlines():
+			match = re.match('^0\/(\d+)\s+(\d+)\s+(\d+)\s+(VLAN Only|untaggedonly|Admit All)\s+(Enable|Disable)\s+(Enable|Disable)\s+(Enable|Disable)\s+(\d+)', line, re.I)
+
+			if match:
+				ident = match.group(1)
+
+				ports[ident].Vlans['mode'] = 'vlanonly' if match.group(4) == 'VLAN Only' else 'all'
+				ports[ident].Vlans['ingressfilter'] = True if match.group(6) == 'Enable' else False
+				if ports[ident].Vlans['mode'] == 'all':
+					ports[ident].Vlans['untagged'] = match.group(3)
+
+		return ports
+
+	def getVlanList(self, ssh):
+		logging.debug('Getting VLAN list')
+
+		ssh.sendline('show vlan')
+
+		index = 0
+
+		vlans = {}
+
+		while index == 0:
+			index = ssh.expect(['--More-- or \(q\)uit', ssh.PROMPT])
+
+			vlans = self.parseVlanList(ssh.before, vlans)
+			ssh.sendline() # Enter
+
+		ssh.prompt()
+
+		return vlans
+
+	def getVlanPortAssociation(self, ssh, vlan, ports):
+		logging.debug('Getting VLAN Port association for VLAN: ' + vlan.Ident)
+
+		ssh.sendline('show vlan ' + vlan.Ident)
+
+		index = 0
+
+		while index == 0:
+			index = ssh.expect(['--More-- or \(q\)uit', ssh.PROMPT])
+
+			ports = self.parseVlanPortAssociationList(ssh.before, vlan, ports)
+			ssh.sendline() # Enter
+
+		ssh.prompt()
+
+		return ports
+
+	def getVlanPortList(self, ssh, ports):
+		logging.debug('Getting VLAN Port list')
+
+		ssh.sendline('show vlan port all')
+
+		index = 0
+
+		while index == 0:
+			index = ssh.expect(['--More-- or \(q\)uit', ssh.PROMPT])
+
+			ports = self.parseVlanPortList(ssh.before, ports)
+			ssh.sendline() # Enter
+
+		ssh.prompt()
+
+		return ports
+
+	def getPorts(self, ssh, vlans):
+		ssh.sendline('show port all')
+
+		index = 0
+
+		ports = {}
+
+		while index == 0:
+			index = ssh.expect(['--More-- or \(q\)uit', ssh.PROMPT])
+
+			ports = self.parsePortList(ssh.before, ports)
+			ssh.sendline() # Enter
+
+		ssh.prompt()
+
+		for vlan in vlans.values():
+			ports = self.getVlanPortAssociation(ssh, vlan, ports)
+
+		ports = self.getVlanPortList(ssh, ports)
+
+		for ident in netsnmp.snmpwalk(netsnmp.Varbind('IF-MIB::ifIndex'), Version=2, DestHost=self.ip, Community=self.community):
+			if ident in ports:
+				descr, inOctets, inUcastPkts, inMulticastPkts, inBroadcastPkts, outOctets, outUcastPkts, outMulticastPkts, outBroadcastPkts = netsnmp.snmpget(
+					netsnmp.Varbind('IF-MIB::ifDescr', ident),
+					netsnmp.Varbind('IF-MIB::ifInOctets', ident),
+					netsnmp.Varbind('IF-MIB::ifInUcastPkts', ident),
+					netsnmp.Varbind('IF-MIB::ifInMulticastPkts', ident),
+					netsnmp.Varbind('IF-MIB::ifInBroadcastPkts', ident),
+					netsnmp.Varbind('IF-MIB::ifOutOctets', ident),
+					netsnmp.Varbind('IF-MIB::ifOutUcastPkts', ident),
+					netsnmp.Varbind('IF-MIB::ifOutMulticastPkts', ident),
+					netsnmp.Varbind('IF-MIB::ifOutBroadcastPkts', ident),
+					Version=2, DestHost=self.ip, Community=self.community)
+
+				ports[ident].Description = descr
+
+				ports[ident].InOctets = inOctets
+				ports[ident].InUcastPkts = inUcastPkts
+				ports[ident].InMulticastPkts = inMulticastPkts
+				ports[ident].InBroadcastPkts = inBroadcastPkts
+
+				ports[ident].OutOctets = outOctets
+				ports[ident].OutUcastPkts = outUcastPkts
+				ports[ident].OutMulticastPkts = outMulticastPkts
+				ports[ident].OutBroadcastPkts = outBroadcastPkts
+
+		return ports
+
+	def createVlan(self, ssh, vlan_id):
+		logging.debug('creating missing vlan ' + vlan_id)
+
+		ssh.sendline('vlan database')
+
+		ssh.prompt()
+
+		ssh.sendline('vlan ' + vlan_id)
+
+		ssh.prompt()
+
+		ssh.sendline('exit')
+		ssh.prompt()
+
+	def Status(self):
+		logging.debug('Calling status function')
+
+		ssh = self.login()
+
+		vlans = self.getVlanList(ssh)
+
+		ports = self.getPorts(ssh, vlans)
+
+		self.logout(ssh)
+
+		output = '<doc>'
+
+		for port in ports.values():
+			output += '<port>'
+			output += '<identity>' + port.Ident + '</identity>'
+			output += '<description>' + port.Description + '</description>'
+			output += '<admin_status>' + port.AdminMode + '</admin_status>'
+			output += '<oper_status>' + port.LinkStatus + '</oper_status>'
+			output += '<duplex>' + port.Duplex + '</duplex>'
+			if port.PhysicalStatus and port.PhysicalStatus != 'unknown':
+				output += '<speed>' + port.PhysicalStatus + '</speed>'
+			else:
+				output += '<speed>' + port.PhysicalMode + '</speed>'
+
+			output += '<txbytes>' + port.InOctets + '</txbytes>'
+			output += '<rxbytes>' + port.OutOctets + '</rxbytes>'
+
+			txpackets = int(port.InUcastPkts) + int(port.InMulticastPkts) + int(port.InBroadcastPkts)
+			rxpackets = int(port.OutUcastPkts) + int(port.OutMulticastPkts) + int(port.OutBroadcastPkts)
+
+			output += '<txpackets>' + str(txpackets) + '</txpackets>'
+			output += '<rxpackets>' + str(rxpackets) + '</rxpackets>'
+
+			if port.Vlans['untagged']:
+				output += '<vlan_id>' + port.Vlans['untagged'] + '</vlan_id>'
+				output += '<vlan_name>' + vlans[port.Vlans['untagged']].Description + '</vlan_name>'
+			else:
+				output += '<vlan_id>-1</vlan_id>'
+
+			if port.Vlans['tagged']:
+				output += '<is_trunk>on</is_trunk>'
+				output += '<trunk_members>' + ','.join(port.Vlans['tagged']) + '</trunk_members>'
+			else:
+				output += '<is_trunk>off</is_trunk>'
+
+			output += '</port>'
+
+		output += '</doc>'
+		print output
+
+	def Statistics(self):
+		logging.debug('Calling statistics function')
+		self.Status()
+
+	def enablePort(self, ident):
+		logging.debug('Calling enablePort function')
+		logging.debug('Enabling port ' + ident)
+
+		ssh = self.login()
+
+		ssh.sendline('config')
+		ssh.prompt()
+
+		ssh.sendline('interface 0/' + ident)
+		ssh.prompt()
+
+		ssh.sendline('no shutdown')
+		ssh.prompt()
+
+		ssh.sendline('exit')
+		ssh.prompt()
+
+		ssh.sendline('exit')
+		ssh.prompt()
+
+		self.logout(ssh)
+
+		output = '<doc><port>'
+		output += '<identity>' + ident + '</identity>'
+		output += '<admin_status>on</admin_status>'
+		output += '</port></doc>'
+		print output
+
+	def disablePort(self, ident):
+		logging.debug('Calling disablePort function')
+		logging.debug('Disabling port ' + ident)
+
+		ssh = self.login()
+
+		ssh.sendline('config')
+		ssh.prompt()
+
+		ssh.sendline('interface 0/' + ident)
+		ssh.prompt()
+
+		ssh.sendline('shutdown')
+		ssh.prompt()
+
+		ssh.sendline('exit')
+		ssh.prompt()
+
+		ssh.sendline('exit')
+		ssh.prompt()
+
+		self.logout(ssh)
+
+		output = '<doc><port>'
+		output += '<identity>' + ident + '</identity>'
+		output += '<admin_status>off</admin_status>'
+		output += '</port></doc>'
+		print output
+
+	def setPortVlan(self, ident, vlan_id, is_trunk = False, trunk_members = []):
+		logging.debug('Setting VLANs for port ' + ident)
+
+		ssh = self.login()
+
+		vlans = self.getVlanList(ssh)
+
+		ports = self.getPorts(ssh, vlans)
+
+		port = ports[ident]
+
+		missingVlans = []
+
+		if vlan_id != '-1' and vlan_id not in vlans:
+			missingVlans.append(vlan_id)
+
+		if is_trunk:
+			for member in trunk_members:
+				if member not in vlans:
+					if member not in missingVlans:
+						missingVlans.append(member)
+		else:
+			trunk_members = []
+
+		for missing in missingVlans:
+			self.createVlan(ssh, missing)
+
+		mode = 'all'
+
+		if vlan_id == '-1':
+			mode = 'vlanonly'
+		elif vlan_id and not is_trunk:
+			mode = 'all' # admituntaggedonly not supported by all switches
+
+		vlansRemoveTag = listDiff(port.Vlans['tagged'], trunk_members)
+		vlansAddTag = listDiff(trunk_members, port.Vlans['tagged'])
+
+		vlansRemove = list(vlansRemoveTag)
+		vlansAdd = list(vlansAddTag)
+
+		setPvid = False;
+
+		if vlan_id and vlan_id != '-1':
+			setPvid = True
+
+			if vlan_id in vlansRemove:
+				vlansRemove.remove(vlan_id)
+			else:
+				if vlan_id != port.Vlans['untagged'] and vlan_id not in trunk_members and vlan_id not in vlansAdd:
+					vlansAdd.append(vlan_id)
+
+		if port.Vlans['untagged'] and vlan_id != port.Vlans['untagged'] and port.Vlans['untagged'] not in trunk_members and port.Vlans['untagged'] not in vlansRemove:
+			vlansRemove.append(port.Vlans['untagged'])
+
+
+		#print 'mode: ' + mode
+		#print 'vlan_id: ' + vlan_id
+		#print 'is_trunk: ' + str(is_trunk)
+		#print 'trunk_members: ' + str(trunk_members)
+		#print 'currentTagged: ' + str(port.Vlans['tagged'])
+		#print 'currentUntagged: ' + str(port.Vlans['untagged'])
+		#print 'vlansRemoveTag: ' + str(vlansRemoveTag)
+		#print 'vlansAddTag: ' + str(vlansAddTag)
+		#print 'vlansRemove: ' + str(vlansRemove)
+		#print 'vlansAdd: ' + str(vlansAdd)
+		#print 'setPvid: ' + str(setPvid)
+
+		ssh.sendline('config')
+		ssh.prompt()
+
+		ssh.sendline('interface 0/' + ident)
+		ssh.prompt()
+
+		for vlan in vlansRemoveTag:
+			ssh.sendline('no vlan tagging ' + vlan)
+			ssh.prompt()
+
+		for vlan in vlansRemove:
+			ssh.sendline('vlan participation exclude ' + vlan)
+			ssh.prompt()
+
+		for vlan in vlansAdd:
+			ssh.sendline('vlan participation include ' + vlan)
+			ssh.prompt()
+
+		for vlan in vlansAddTag:
+			ssh.sendline('vlan tagging ' + vlan)
+			ssh.prompt()
+
+		if setPvid:
+			ssh.sendline('vlan pvid ' + vlan_id)
+			ssh.prompt()
+		else:
+			ssh.sendline('vlan pvid 1')
+			ssh.prompt()
+
+		if not port.Vlans['ingressfilter']:
+			ssh.sendline('vlan ingressfilter')
+			ssh.prompt()
+
+		if mode != port.Vlans['mode']:
+			ssh.sendline('vlan acceptframe ' + mode)
+			ssh.prompt()
+
+		ssh.sendline('exit')
+		ssh.prompt()
+
+		ssh.sendline('exit')
+		ssh.prompt()
+
+		vlans = self.getVlanList(ssh)
+
+		ports = self.getPorts(ssh, vlans)
+
+		port = ports[ident]
+
+		output = '<doc>'
+
+		output += '<port>'
+		output += '<identity>' + port.Ident + '</identity>'
+		if port.Vlans['untagged']:
+			output += '<vlan_id>' + port.Vlans['untagged'] + '</vlan_id>'
+			output += '<vlan_name>' + vlans[port.Vlans['untagged']].Description + '</vlan_name>'
+		else:
+			output += '<vlan_id>-1</vlan_id>'
+
+		if port.Vlans['tagged']:
+			output += '<is_trunk>on</is_trunk>'
+			output += '<trunk_members>' + ','.join(port.Vlans['tagged']) + '</trunk_members>'
+		else:
+			output += '<is_trunk>off</is_trunk>'
+
+		output += '</port>'
+
+		output += '</doc>'
+
+		print output
+
+		self.logout(ssh)
+
+	class SwitchPort:
+		def __init__( self, ident ):
+			self.Ident = ident
+			self.Description = None
+			self.AdminMode = None
+			self.PhysicalMode = None
+			self.PhysicalStatus = None
+			self.LinkStatus = None
+			self.InOctets = 0
+			self.InUcastPkts = 0
+			self.InMulticastPkts = 0
+			self.InBroadcastPkts = 0
+			self.OutOctets = 0
+			self.OutUcastPkts = 0
+			self.OutMulticastPkts = 0
+			self.OutBroadcastPkts = 0
+			self.Vlans = {
+				'tagged': [],
+				'untagged': None,
+				'mode': None
+			}
+
+	class SwitchVlan:
+		def __init__( self, ident ):
+			self.Ident = ident
+			Description = None
+
+	@staticmethod
+	def Info():
+		logging.debug('Calling info function')
+
+		output = "<doc>"
+		# Device type
+		output += "<type>Switch</type>"
+		output += "<name>Quanta LB4M/LB6M</name>"
+		# Use SSH
+		output += "<requirements>"
+		output += "<ssh/>"
+		output += "<snmpv2c/>"
+		output += "</requirements>"
+		output += "<supported_funcs>"
+        # Get list of ports
+		output += "<status/>"
+		# Get port statistics
+		output += "<statistics/>"
+        #Disable Port
+		output += "<port_off/>"
+        # Enable Port
+		output += "<port_on/>"
+		# Set VLAN
+		output += "<set_vlan/>"
+		output += "</supported_funcs>"
+		output += "</doc>"
+
+		print output
+
+	ip = None
+	username = None
+	password = None
+	community = None
+
+def main():
+	input = sys.argv
+	sep = ', '
+	inputlist = sep.join(input)
+
+	logging.basicConfig(filename='/root/quanta.log', level=logging.INFO)
+	logging.info(inputlist)
+
+	if len(sys.argv) > 1 and sys.argv[1] == '-info':
+		#If there is a -info key - show information about handler.
+		QuantaHandler.Info()
+	else:
+		#In all other cases read input stream and make handler's object,
+		#for processing DCImanager request
+		request_str = sys.stdin.read()
+		logging.debug(request_str)
+
+		QuantaHandler(request_str)
+
+# Launch of main function
+main()
