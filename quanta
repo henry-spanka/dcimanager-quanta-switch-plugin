@@ -148,7 +148,7 @@ class QuantaHandler:
 
 	def parsePortList(self, port_string, ports = {}):
 		for line in port_string.splitlines():
-			match = re.match('^0\/(\d+)\s+(Mirror|Probe)?\s+(Enable|Disable)\s+([a-zA-Z0-9]+\s[a-zA-Z]+|Auto)\s+([a-zA-Z0-9]+\s[a-zA-Z]+)?\s+(Up|Down)\s+(Enable|Disable)\s+(Enable|Disable)\s+([a-zA-Z]+)', line, re.I)
+			match = re.match('^0\/(\d+)\s+(Mirror|Probe|PC Mbr)?\s+(Enable|Disable)\s+([a-zA-Z0-9]+\s[a-zA-Z]+|Auto)\s+([a-zA-Z0-9]+\s[a-zA-Z]+)?\s+(Up|Down)\s+(Enable|Disable)\s+(Enable|Disable)\s+([a-zA-Z]+)', line, re.I)
 
 			if match:
 				ident = match.group(1)
